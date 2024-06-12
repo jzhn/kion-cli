@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
-	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -119,26 +117,11 @@ func AuthenticateSAML(appUrl string, metadata *samlTypes.EntityDescriptor, servi
 			},
 		}
 
-		// get csrf token
-		csrfToken, csrfCookie, err := getCSRFToken(appUrl, client)
-		if err != nil {
-			fmt.Println("error getting csrf token: ", csrfToken)
-			tokenChan <- SamlCallbackResult{Data: nil, Err: fmt.Errorf("error getting CSRF token: %s", csrfToken)}
-			return
-		}
-
-		// update the client to use the csrf cookies
 		jar, err := cookiejar.New(nil)
 		if err != nil {
 			tokenChan <- SamlCallbackResult{Data: nil, Err: fmt.Errorf("failed to create an empty cookie jar: %w", err)}
 			return
 		}
-		url, err := url.Parse(appUrl)
-		if err != nil {
-			tokenChan <- SamlCallbackResult{Data: nil, Err: fmt.Errorf("failed to parse ssl url: %w", err)}
-			return
-		}
-		jar.SetCookies(url, csrfCookie)
 		client.Jar = jar
 
 		r, err := http.NewRequest("POST", appUrl+"/api/v1/saml/callback", bytes.NewReader(b))
@@ -162,7 +145,7 @@ func AuthenticateSAML(appUrl string, metadata *samlTypes.EntityDescriptor, servi
 			return
 		}
 
-		ssoCodeRegexp, err := regexp.Compile(`code=(.+)">`)
+		ssoCodeRegexp, err := regexp.Compile(`token: '(.+)',`)
 		if err != nil {
 			tokenChan <- SamlCallbackResult{Data: nil, Err: fmt.Errorf("failed to compile access token regular expression: %w", err)}
 			return
@@ -174,13 +157,6 @@ func AuthenticateSAML(appUrl string, metadata *samlTypes.EntityDescriptor, servi
 		}
 		// parse the sso code from the groups
 		ssoCode := groups[1]
-
-		// get auth and refresh token
-		authToken, refreshCookie, err := getAuthToken(appUrl, ssoCode, csrfToken, client)
-		if err != nil {
-			tokenChan <- SamlCallbackResult{Data: nil, Err: fmt.Errorf("failed to get auth token: %w", err)}
-			return
-		}
 
 		// send auto-close response before returning token
 		_, err = rw.Write([]byte(`
@@ -225,9 +201,7 @@ func AuthenticateSAML(appUrl string, metadata *samlTypes.EntityDescriptor, servi
 		}
 
 		tokenChan <- SamlCallbackResult{Data: &AuthData{
-			AuthToken: authToken,
-			Cookies:   append(refreshCookie, csrfCookie...),
-			CSRFToken: csrfToken,
+			AuthToken: ssoCode,
 		}, Err: nil}
 	})
 
@@ -316,51 +290,4 @@ func ReadSAMLMetadataFile(metadataFile string) (*samlTypes.EntityDescriptor, err
 	}
 
 	return metadata, nil
-}
-
-func getCSRFToken(appUrl string, client *http.Client) (string, []*http.Cookie, error) {
-	csrfReq, err := http.NewRequest("GET", appUrl+"/api/v2/csrf-token", nil)
-	if err != nil {
-		return "", nil, err
-	}
-	csrfResp, err := client.Do(csrfReq)
-	if err != nil {
-		return "", nil, err
-	}
-	defer csrfResp.Body.Close()
-	csrfBody, err := io.ReadAll(csrfResp.Body)
-	csrfCookie := csrfResp.Cookies()
-	if err != nil {
-		return "", nil, err
-	}
-	var csrfData CSRFResponse
-	err = json.Unmarshal(csrfBody, &csrfData)
-	if err != nil {
-		return "", nil, err
-	}
-	return csrfData.Data, csrfCookie, nil
-}
-
-func getAuthToken(appUrl string, ssoCode string, csrfToken string, client *http.Client) (string, []*http.Cookie, error) {
-	authReq, err := http.NewRequest("GET", appUrl+"/api/v2/login/sso-provider?code="+ssoCode, nil)
-	authReq.Header.Set("X-Csrf-Token", csrfToken)
-	if err != nil {
-		return "", nil, err
-	}
-	authResp, err := client.Do(authReq)
-	if err != nil {
-		return "", nil, err
-	}
-	defer authResp.Body.Close()
-	authBody, err := io.ReadAll(authResp.Body)
-	if err != nil {
-		return "", nil, err
-	}
-
-	var authData SSOAuthResponse
-	err = json.Unmarshal(authBody, &authData)
-	if err != nil {
-		return "", nil, err
-	}
-	return authData.Data.Access.Token, authResp.Cookies(), nil
 }
